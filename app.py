@@ -1,19 +1,26 @@
 from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 import requests
 import os
 import json
 import time
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # NVIDIA NIM API configuration
 NIM_API_KEY = os.environ.get('NIM_API_KEY', '')
 NIM_BASE_URL = os.environ.get('NIM_BASE_URL', 'https://integrate.api.nvidia.com/v1')
 
-@app.route('/v1/chat/completions', methods=['POST'])
+@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def chat_completions():
+    # Handle preflight OPTIONS request
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
         data = request.json
+        print(f"Received request: {json.dumps(data, indent=2)}")
         
         # Extract OpenAI format parameters
         messages = data.get('messages', [])
@@ -36,40 +43,109 @@ def chat_completions():
             'Content-Type': 'application/json'
         }
         
+        print(f"Sending to NIM: {NIM_BASE_URL}/chat/completions")
+        
         if stream:
             return handle_stream(nim_payload, headers)
         else:
             return handle_non_stream(nim_payload, headers)
             
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Error: {str(e)}")
+        error_response = {
+            'error': {
+                'message': str(e),
+                'type': 'proxy_error',
+                'code': 'internal_error'
+            }
+        }
+        return jsonify(error_response), 500
 
 def handle_non_stream(payload, headers):
-    response = requests.post(
-        f'{NIM_BASE_URL}/chat/completions',
-        headers=headers,
-        json=payload
-    )
-    
-    if response.status_code != 200:
-        return jsonify({'error': response.text}), response.status_code
-    
-    return jsonify(response.json())
-
-def handle_stream(payload, headers):
-    def generate():
+    try:
         response = requests.post(
             f'{NIM_BASE_URL}/chat/completions',
             headers=headers,
             json=payload,
-            stream=True
+            timeout=120
         )
         
-        for line in response.iter_lines():
-            if line:
-                decoded = line.decode('utf-8')
-                if decoded.startswith('data: '):
-                    yield decoded + '\n\n'
+        print(f"NIM response status: {response.status_code}")
+        print(f"NIM response: {response.text[:500]}")
+        
+        if response.status_code != 200:
+            error_response = {
+                'error': {
+                    'message': f'NVIDIA NIM API error: {response.text}',
+                    'type': 'nim_api_error',
+                    'code': str(response.status_code)
+                }
+            }
+            return jsonify(error_response), response.status_code
+        
+        nim_response = response.json()
+        
+        # Ensure response is in OpenAI format
+        if 'choices' in nim_response:
+            return jsonify(nim_response)
+        else:
+            # Convert to OpenAI format if needed
+            openai_response = {
+                'id': nim_response.get('id', f'chatcmpl-{int(time.time())}'),
+                'object': 'chat.completion',
+                'created': int(time.time()),
+                'model': payload['model'],
+                'choices': [{
+                    'index': 0,
+                    'message': {
+                        'role': 'assistant',
+                        'content': nim_response.get('content', '')
+                    },
+                    'finish_reason': 'stop'
+                }],
+                'usage': nim_response.get('usage', {})
+            }
+            return jsonify(openai_response)
+            
+    except requests.exceptions.Timeout:
+        error_response = {
+            'error': {
+                'message': 'Request to NVIDIA NIM timed out',
+                'type': 'timeout_error',
+                'code': 'timeout'
+            }
+        }
+        return jsonify(error_response), 504
+    except Exception as e:
+        print(f"Request error: {str(e)}")
+        error_response = {
+            'error': {
+                'message': str(e),
+                'type': 'request_error',
+                'code': 'internal_error'
+            }
+        }
+        return jsonify(error_response), 500
+
+def handle_stream(payload, headers):
+    def generate():
+        try:
+            response = requests.post(
+                f'{NIM_BASE_URL}/chat/completions',
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=120
+            )
+            
+            for line in response.iter_lines():
+                if line:
+                    decoded = line.decode('utf-8')
+                    if decoded.startswith('data: '):
+                        yield decoded + '\n\n'
+        except Exception as e:
+            print(f"Stream error: {str(e)}")
+            yield f'data: {json.dumps({"error": str(e)})}\n\n'
     
     return Response(generate(), mimetype='text/event-stream')
 
@@ -90,6 +166,12 @@ def list_models():
                 'object': 'model',
                 'created': int(time.time()),
                 'owned_by': 'nvidia'
+            },
+            {
+                'id': 'meta/llama-3.1-8b-instruct',
+                'object': 'model',
+                'created': int(time.time()),
+                'owned_by': 'nvidia'
             }
         ]
     }
@@ -97,7 +179,22 @@ def list_models():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({
+        'status': 'ok',
+        'nim_configured': bool(NIM_API_KEY),
+        'nim_base_url': NIM_BASE_URL
+    })
+
+@app.route('/', methods=['GET'])
+def root():
+    return jsonify({
+        'status': 'OpenAI-compatible NVIDIA NIM Proxy',
+        'endpoints': {
+            'chat': '/v1/chat/completions',
+            'models': '/v1/models',
+            'health': '/health'
+        }
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
